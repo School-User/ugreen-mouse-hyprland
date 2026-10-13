@@ -17,9 +17,16 @@ like KM Center, this app does everything on the computer side.
 - Pointer speed (-1 … 1) and acceleration profile (adaptive / flat)
 - Scroll speed multiplier and natural scrolling
 - Left-handed button swap
-- Middle / back / forward buttons: default, copy, paste, previous / next workspace,
-  close window, volume down / up, mute, screenshot, or any custom command.
-  Copy and paste also work in terminals.
+- Separate **click** and **hold** actions for the middle and side buttons, plus
+  **hold + wheel up / down** for the side buttons (e.g. hold back and scroll to change
+  volume). The hold delay is adjustable.
+- Actions: copy, paste, previous / next workspace, close window, volume down / up, mute,
+  screenshot, or any custom command. Copy and paste also work in terminals. A button
+  with a hold or wheel action still does its normal click (back / forward / middle)
+  when tapped.
+
+While a side button is held, the wheel acts at most once every 300 ms (Hyprland's
+`binds:scroll_event_delay`). Normal scrolling is never captured.
 
 The volume and screenshot presets call [Omarchy](https://omarchy.org) helpers
 (`omarchy-audio-output-volume`, `omarchy-capture-screenshot`). On other setups, use

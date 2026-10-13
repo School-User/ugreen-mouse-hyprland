@@ -4,7 +4,8 @@
 The receiver (2b89:0043) speaks a vendor protocol no UGREEN software supports, so
 like KM Center does for this model, everything here is applied by the compositor:
 per-device libinput settings (hl.device) and button remaps restricted to this
-mouse (hl.bind ... device = { list = { DEVICE } }).
+mouse (hl.bind ... device = { list = { DEVICE } }), including click / hold /
+hold + wheel actions.
 
   ugreen-mouse-settings              open the settings window
   ugreen-mouse-settings --apply      regenerate the Hyprland config from saved settings
@@ -17,16 +18,20 @@ SETTINGS_PATH = os.path.expanduser('~/.config/ugreen-mouse/settings.json')
 LUA_PATH = os.path.expanduser('~/.config/hypr/ugreen_mouse.lua')
 REQUIRE_LINE = 'require("hypr.ugreen_mouse")'
 
-BUTTONS = [('middle', 'mouse:274', 'Middle button'),
-           ('back', 'mouse:275', 'Back side button'),
-           ('forward', 'mouse:276', 'Forward side button')]
+ALL_SLOTS = ('tap', 'hold', 'wheel_up', 'wheel_down')
+SLOT_LABELS = {'tap': 'Click', 'hold': 'Hold', 'wheel_up': 'Hold + wheel up', 'wheel_down': 'Hold + wheel down'}
+LUA_SLOT = {'tap': 'tap', 'hold': 'hold', 'wheel_up': 'up', 'wheel_down': 'down'}
+BUTTONS = [('middle', 'mouse:274', 'Middle button', ('tap', 'hold')),
+           ('back', 'mouse:275', 'Back side button', ALL_SLOTS),
+           ('forward', 'mouse:276', 'Forward side button', ALL_SLOTS)]
 
 
 def _exec(cmd):
     return f'hl.dsp.exec_cmd("{cmd}")'
 
 
-# action id -> (label, Lua dispatcher; None = leave the button alone)
+# action id -> (label, Lua dispatcher). 'default' = the button's own click for
+# "Click", nothing for the other slots; 'custom' uses the slot's command.
 ACTIONS = {
     'default': ('Default', None),
     'copy': ('Copy', 'clip("CTRL", "C", "CTRL", "Insert")'),
@@ -46,8 +51,7 @@ ACCELS = ['adaptive', 'flat']
 # Hyprland's own defaults.
 DEFAULTS = {
     'sensitivity': 0.0, 'accel_profile': 'adaptive', 'scroll_factor': 1.0,
-    'natural_scroll': False, 'left_handed': False,
-    'buttons': {b: {'action': 'default', 'command': ''} for b, _, _ in BUTTONS},
+    'natural_scroll': False, 'left_handed': False, 'hold_ms': 400,
 }
 
 CLIP_HELPER = '''-- Same trick as Omarchy's universal clipboard: terminals get CTRL/SHIFT+Insert.
@@ -66,29 +70,108 @@ local function clip(mods, key, term_mods, term_key)
 end
 '''
 
+# Click / hold / hold+wheel engine. The wheel binds stay disabled except while a
+# side button is held, so normal scrolling is never captured. Hyprland debounces
+# wheel binds (binds:scroll_event_delay, 300 ms by default).
+RUNTIME = '''local ONLY = { inclusive = true, list = { DEVICE } }
+
+local function run(action)
+  if type(action) == "function" then action() elseif action then hl.dispatch(action) end
+end
+
+-- Re-send the button's own click (e.g. back/forward) when it has extra actions.
+local function native(key)
+  return function()
+    hl.dispatch(hl.dsp.send_key_state({ mods = "", key = key, state = "down" }))
+    hl.timer(function()
+      hl.dispatch(hl.dsp.send_key_state({ mods = "", key = key, state = "up" }))
+    end, { timeout = 20, type = "oneshot" })
+  end
+end
+
+local state = { active = nil, held = false, used = false }
+local wheel, hold_timer, safety = {}, nil, nil
+
+local function set_wheel(on)
+  for _, bind in ipairs(wheel) do bind:set_enabled(on) end
+end
+
+local function make_wheel_binds()
+  if #wheel > 0 then return end
+  for _, dir in ipairs({ "up", "down" }) do
+    local bind = hl.bind("mouse_" .. dir, function()
+      local btn = state.active
+      if btn and btn[dir] then
+        state.used = true
+        run(btn[dir])
+      end
+    end, { device = ONLY, description = "UGREEN mouse: wheel while holding a side button" })
+    bind:set_enabled(false)
+    table.insert(wheel, bind)
+  end
+end
+
+local function tap_hold(key, label, btn)
+  if btn.up or btn.down then make_wheel_binds() end
+  hl.bind(key, function()
+    state.active, state.held, state.used = btn, false, false
+    if btn.up or btn.down then
+      set_wheel(true)
+      if safety then safety:set_enabled(false) end
+      -- never leave the wheel captured if a release gets lost
+      safety = hl.timer(function() set_wheel(false) end, { timeout = 15000, type = "oneshot" })
+    end
+    if hold_timer then hold_timer:set_enabled(false) end
+    hold_timer = nil
+    if btn.hold then
+      hold_timer = hl.timer(function()
+        if state.active == btn and not state.used then
+          state.held = true
+          run(btn.hold)
+        end
+      end, { timeout = HOLD_MS, type = "oneshot" })
+    end
+  end, { device = ONLY, description = "UGREEN mouse " .. label .. ": press" })
+  hl.bind(key, function()
+    set_wheel(false)
+    if hold_timer then hold_timer:set_enabled(false) end
+    if state.active == btn and not state.held and not state.used then run(btn.tap) end
+    state.active = nil
+  end, { release = true, device = ONLY, description = "UGREEN mouse " .. label .. ": release" })
+end
+'''
+
+
+def _slot(label, raw):
+    action, cmd = raw.get('action', 'default'), str(raw.get('command', '')).strip()
+    if action not in ACTIONS:
+        raise ValueError(f'{label}: unknown action {action!r}')
+    if action == 'custom' and (not cmd or any(c in cmd for c in '\r\n\0')):
+        raise ValueError(f'{label}: custom command must be a single non-empty line')
+    return {'action': action, 'command': cmd}
+
 
 def validate(raw):
     """Return a clean copy of raw settings, or raise ValueError."""
     s = {**DEFAULTS, **{k: v for k, v in raw.items() if k != 'buttons'}}
-    sens, scroll = float(s['sensitivity']), float(s['scroll_factor'])
+    sens, scroll, hold_ms = float(s['sensitivity']), float(s['scroll_factor']), int(s['hold_ms'])
     if not -1.0 <= sens <= 1.0:
         raise ValueError('Pointer speed must be between -1 and 1')
     if not 0.1 <= scroll <= 5.0:
         raise ValueError('Scroll speed must be between 0.1 and 5')
+    if not 150 <= hold_ms <= 2000:
+        raise ValueError('Hold delay must be between 150 and 2000 ms')
     if s['accel_profile'] not in ACCELS:
         raise ValueError(f'Unknown acceleration profile {s["accel_profile"]!r}')
     buttons = {}
-    for b, _, label in BUTTONS:
-        cfg = {**DEFAULTS['buttons'][b], **raw.get('buttons', {}).get(b, {})}
-        cmd = str(cfg['command']).strip()
-        if cfg['action'] not in ACTIONS:
-            raise ValueError(f'{label}: unknown action {cfg["action"]!r}')
-        if cfg['action'] == 'custom' and (not cmd or any(c in cmd for c in '\r\n\0')):
-            raise ValueError(f'{label}: custom command must be a single non-empty line')
-        buttons[b] = {'action': cfg['action'], 'command': cmd}
+    for b, _, label, slots in BUTTONS:
+        rb = raw.get('buttons', {}).get(b, {})
+        if 'action' in rb:  # 1.0 format: a single click action
+            rb = {'tap': rb}
+        buttons[b] = {slot: _slot(f'{label} {SLOT_LABELS[slot].lower()}', rb.get(slot, {})) for slot in slots}
     return {'sensitivity': round(sens, 2), 'accel_profile': s['accel_profile'],
             'scroll_factor': round(scroll, 2), 'natural_scroll': bool(s['natural_scroll']),
-            'left_handed': bool(s['left_handed']), 'buttons': buttons}
+            'left_handed': bool(s['left_handed']), 'hold_ms': hold_ms, 'buttons': buttons}
 
 
 def lua_str(text):
@@ -99,24 +182,36 @@ def lua_bool(v):
     return 'true' if v else 'false'
 
 
+def dispatcher(slot, cfg, key):
+    """Lua expression for one slot, or None when the slot does nothing."""
+    if cfg['action'] == 'custom':
+        return f'hl.dsp.exec_cmd({lua_str(cfg["command"])})'
+    if cfg['action'] == 'default':
+        return f'native("{key}")' if slot == 'tap' else None
+    return ACTIONS[cfg['action']][1]
+
+
 def generate_lua(s):
     lines = [
         '-- Generated by ugreen-mouse-settings - edits here are overwritten.',
-        f'local DEVICE = {lua_str(DEVICE)}', '',
+        f'local DEVICE = {lua_str(DEVICE)}',
+        f'local HOLD_MS = {s["hold_ms"]}', '',
         f'hl.device({{ name = DEVICE, sensitivity = {s["sensitivity"]:.2f}, '
         f'accel_profile = {lua_str(s["accel_profile"])}, scroll_factor = {s["scroll_factor"]:.2f}, '
         f'natural_scroll = {lua_bool(s["natural_scroll"])}, left_handed = {lua_bool(s["left_handed"])} }})',
-        '', CLIP_HELPER,
+        '', CLIP_HELPER, RUNTIME,
     ]
-    for b, key, label in BUTTONS:
+    for b, key, label, slots in BUTTONS:
         cfg = s['buttons'][b]
-        if cfg['action'] == 'custom':
-            dsp = f'hl.dsp.exec_cmd({lua_str(cfg["command"])})'
-        else:
-            dsp = ACTIONS[cfg['action']][1]
-        if dsp:
-            desc = lua_str(f'UGREEN mouse {label}: {ACTIONS[cfg["action"]][0]}')
-            lines.append(f'hl.bind("{key}", {dsp}, {{ device = {{ inclusive = true, list = {{ DEVICE }} }}, description = {desc} }})')
+        extras = [slot for slot in slots if slot != 'tap' and cfg[slot]['action'] != 'default']
+        if extras:
+            fields = [f'{LUA_SLOT[slot]} = {dsp}' for slot in slots
+                      if (dsp := dispatcher(slot, cfg[slot], key))]
+            lines.append(f'tap_hold("{key}", {lua_str(label)}, {{ {", ".join(fields)} }})')
+        elif cfg['tap']['action'] != 'default':
+            desc = lua_str(f'UGREEN mouse {label}: {ACTIONS[cfg["tap"]["action"]][0]}')
+            lines.append(f'hl.bind("{key}", {dispatcher("tap", cfg["tap"], key)}, '
+                         f'{{ device = ONLY, description = {desc} }})')
     return '\n'.join(lines) + '\n'
 
 
@@ -158,6 +253,7 @@ def mouse_connected():
 
 
 def selftest():
+    # 1.0-format settings still load and give plain binds
     s = validate({'sensitivity': 0.3, 'accel_profile': 'flat',
                   'buttons': {'back': {'action': 'copy'},
                               'forward': {'action': 'custom', 'command': 'notify-send "hi \\o/"'}}})
@@ -165,10 +261,23 @@ def selftest():
     assert 'sensitivity = 0.30, accel_profile = "flat"' in lua
     assert 'hl.bind("mouse:275", clip("CTRL", "C", "CTRL", "Insert")' in lua
     assert 'hl.dsp.exec_cmd("notify-send \\"hi \\\\o/\\"")' in lua
-    assert 'mouse:274' not in lua  # default action = no bind
-    for bad in ({'sensitivity': 2}, {'scroll_factor': 0}, {'accel_profile': 'warp'},
+    assert 'mouse:274' not in lua and 'tap_hold("' not in lua  # defaults = no binds
+    # click/hold/wheel slots go through tap_hold; default click re-sends the button
+    s = validate({'hold_ms': 500, 'buttons': {
+        'back': {'hold': {'action': 'screenshot'}, 'wheel_up': {'action': 'vol_up'}},
+        'middle': {'tap': {'action': 'close'}, 'hold': {'action': 'custom', 'command': 'foo'}}}})
+    lua = generate_lua(s)
+    assert 'local HOLD_MS = 500' in lua
+    assert ('tap_hold("mouse:275", "Back side button", { tap = native("mouse:275"), '
+            'hold = hl.dsp.exec_cmd("omarchy-capture-screenshot"), '
+            'up = hl.dsp.exec_cmd("omarchy-audio-output-volume raise") })') in lua
+    assert ('tap_hold("mouse:274", "Middle button", { tap = hl.dsp.window.close(), '
+            'hold = hl.dsp.exec_cmd("foo") })') in lua
+    assert 'mouse:276' not in lua.split(RUNTIME)[1]
+    for bad in ({'sensitivity': 2}, {'scroll_factor': 0}, {'accel_profile': 'warp'}, {'hold_ms': 50},
                 {'buttons': {'back': {'action': 'custom', 'command': 'a\nb'}}},
-                {'buttons': {'middle': {'action': 'nope'}}}):
+                {'buttons': {'back': {'hold': {'action': 'custom', 'command': ''}}}},
+                {'buttons': {'middle': {'tap': {'action': 'nope'}}}}):
         try:
             validate(bad)
             raise AssertionError(f'accepted {bad}')
@@ -183,11 +292,10 @@ def run_app():
     gi.require_version('Adw', '1')
     from gi.repository import Adw, Gtk
 
-    def scale_row(title, subtitle, lo, hi, step, value):
+    def scale_row(title, subtitle, lo, hi, step, digits=2):
         row = Adw.ActionRow(title=title, subtitle=subtitle)
         scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
-        scale.set_value(value)
-        scale.set_digits(2)
+        scale.set_digits(digits)
         scale.set_draw_value(True)
         scale.set_size_request(220, -1)
         scale.set_valign(Gtk.Align.CENTER)
@@ -215,14 +323,14 @@ def run_app():
         page.add(dev)
 
         pointer = Adw.PreferencesGroup(title='Pointer')
-        speed_row, speed = scale_row('Speed', 'Slow to fast', -1.0, 1.0, 0.05, 0)
+        speed_row, speed = scale_row('Speed', 'Slow to fast', -1.0, 1.0, 0.05)
         accel = Adw.ComboRow(title='Acceleration', model=Gtk.StringList.new(['Adaptive', 'Flat (raw)']))
         pointer.add(speed_row)
         pointer.add(accel)
         page.add(pointer)
 
         scrolling = Adw.PreferencesGroup(title='Scrolling')
-        scroll_row, scroll = scale_row('Scroll speed', 'Multiplier', 0.1, 5.0, 0.1, 1)
+        scroll_row, scroll = scale_row('Scroll speed', 'Multiplier', 0.1, 5.0, 0.1)
         natural = Adw.SwitchRow(title='Natural scrolling', subtitle='Content follows the wheel')
         scrolling.add(scroll_row)
         scrolling.add(natural)
@@ -230,16 +338,25 @@ def run_app():
 
         buttons = Adw.PreferencesGroup(title='Buttons', description='Remaps apply to this mouse only')
         lefty = Adw.SwitchRow(title='Left-handed', subtitle='Swap left and right buttons')
+        hold_row, hold_ms = scale_row('Hold delay', 'Milliseconds before a press counts as a hold',
+                                      150, 1000, 50, digits=0)
         buttons.add(lefty)
+        buttons.add(hold_row)
+        click_labels = Gtk.StringList.new([ACTIONS[a][0] for a in ACTION_IDS])
+        extra_labels = Gtk.StringList.new(['None'] + [ACTIONS[a][0] for a in ACTION_IDS[1:]])
         combos, entries = {}, {}
-        labels = Gtk.StringList.new([ACTIONS[a][0] for a in ACTION_IDS])
-        for b, _, label in BUTTONS:
-            combo = Adw.ComboRow(title=label, model=labels)
-            entry = Adw.EntryRow(title=f'{label} command')
-            combo.connect('notify::selected', lambda c, _p, e=entry: e.set_visible(ACTION_IDS[c.get_selected()] == 'custom'))
-            buttons.add(combo)
-            buttons.add(entry)
-            combos[b], entries[b] = combo, entry
+        for b, _, label, slots in BUTTONS:
+            expander = Adw.ExpanderRow(title=label, subtitle=', '.join(SLOT_LABELS[s] for s in slots))
+            for slot in slots:
+                combo = Adw.ComboRow(title=SLOT_LABELS[slot],
+                                     model=click_labels if slot == 'tap' else extra_labels)
+                entry = Adw.EntryRow(title=f'{SLOT_LABELS[slot]} command')
+                combo.connect('notify::selected',
+                              lambda c, _p, e=entry: e.set_visible(ACTION_IDS[c.get_selected()] == 'custom'))
+                expander.add_row(combo)
+                expander.add_row(entry)
+                combos[b, slot], entries[b, slot] = combo, entry
+            buttons.add(expander)
         page.add(buttons)
 
         def show(s):
@@ -248,17 +365,22 @@ def run_app():
             scroll.set_value(s['scroll_factor'])
             natural.set_active(s['natural_scroll'])
             lefty.set_active(s['left_handed'])
-            for b, _, _ in BUTTONS:
-                combos[b].set_selected(ACTION_IDS.index(s['buttons'][b]['action']))
-                entries[b].set_text(s['buttons'][b]['command'])
-                entries[b].set_visible(s['buttons'][b]['action'] == 'custom')
+            hold_ms.set_value(s['hold_ms'])
+            for (b, slot), combo in combos.items():
+                cfg = s['buttons'][b][slot]
+                combo.set_selected(ACTION_IDS.index(cfg['action']))
+                entries[b, slot].set_text(cfg['command'])
+                entries[b, slot].set_visible(cfg['action'] == 'custom')
 
         def collect():
+            buttons_cfg = {b: {} for b, _, _, _ in BUTTONS}
+            for (b, slot), combo in combos.items():
+                buttons_cfg[b][slot] = {'action': ACTION_IDS[combo.get_selected()],
+                                        'command': entries[b, slot].get_text()}
             return {'sensitivity': speed.get_value(), 'accel_profile': ACCELS[accel.get_selected()],
                     'scroll_factor': scroll.get_value(), 'natural_scroll': natural.get_active(),
-                    'left_handed': lefty.get_active(),
-                    'buttons': {b: {'action': ACTION_IDS[combos[b].get_selected()], 'command': entries[b].get_text()}
-                                for b, _, _ in BUTTONS}}
+                    'left_handed': lefty.get_active(), 'hold_ms': int(hold_ms.get_value()),
+                    'buttons': buttons_cfg}
 
         def on_apply(_btn):
             try:
