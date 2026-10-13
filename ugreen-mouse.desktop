@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=UGREEN Mouse
+Comment=Speed, scrolling and button remaps for the UGREEN wireless mouse
+Exec=ugreen-mouse-settings
+Icon=input-mouse
+Categories=Settings;HardwareSettings;
+Keywords=mouse;dpi;sensitivity;buttons;ugreen;
